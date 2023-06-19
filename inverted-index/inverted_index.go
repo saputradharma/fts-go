@@ -2,8 +2,12 @@ package inverted_index
 
 import (
 	"encoding/xml"
+	"fmt"
+	"math"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/bbalet/stopwords"
 	"github.com/kljensen/snowball"
@@ -12,6 +16,7 @@ import (
 type invertedIndex struct {
 	index     map[string][]int
 	documents map[int]document
+	sync.RWMutex
 }
 
 func New(path string) (*invertedIndex, error) {
@@ -31,6 +36,9 @@ func New(path string) (*invertedIndex, error) {
 // LoadDocument is to load the xml document data
 // the data also will be added to the index list
 func (e *invertedIndex) LoadDocument(path string) error {
+	start := time.Now()
+	fmt.Println("Loading document...")
+
 	file, err := os.Open(path)
 
 	if err != nil {
@@ -46,21 +54,37 @@ func (e *invertedIndex) LoadDocument(path string) error {
 		return err
 	}
 
+	numOfWorkers := 100
+	wg := new(sync.WaitGroup)
+	documentChannel := make(chan document)
+
+	// initialize concurrent workers
+	for i := 0; i < numOfWorkers; i++ {
+		go e.addParallel(wg, documentChannel)
+	}
+
+	// pass documents to workers
 	for k, d := range xDoc.Documents {
 		d.ID = k
-		e.add(d)
+		wg.Add(1)
+		documentChannel <- d
 	}
+
+	close(documentChannel)
+	wg.Wait()
+
+	fmt.Printf("Load documents done in: %d seconds\n", int(math.Ceil(time.Since(start).Seconds())))
 
 	return nil
 }
 
 // Search searching documents based on a keyword
 func (e *invertedIndex) Search(keyword string) []document {
-
 	tokens, _ := e.tokenize(keyword)
 
 	queryResult := make(map[int]document)
 	for _, t := range tokens {
+		e.Lock()
 		if ids, ok := e.index[t]; ok {
 			for _, id := range ids {
 				// only add non-exists documentId to queryResult
@@ -69,6 +93,7 @@ func (e *invertedIndex) Search(keyword string) []document {
 				}
 			}
 		}
+		e.Unlock()
 	}
 	result := []document{}
 	for _, d := range queryResult {
@@ -77,9 +102,22 @@ func (e *invertedIndex) Search(keyword string) []document {
 	return result
 }
 
+// addParallel add document with concurrent workers
+func (e *invertedIndex) addParallel(wg *sync.WaitGroup, documentChannel <-chan document) {
+	for d := range documentChannel {
+		e.add(d)
+		wg.Done()
+	}
+}
+
+// add add document to the index
 func (e *invertedIndex) add(d document) {
+	e.Lock()
 	e.documents[d.ID] = d
+	e.Unlock()
+
 	e.addIndex(d.Abstract, d.ID)
+
 }
 
 func (e *invertedIndex) addIndex(text string, documentId int) error {
@@ -92,6 +130,7 @@ func (e *invertedIndex) addIndex(text string, documentId int) error {
 	// add new tokens to index
 	for _, st := range tokens {
 		// exists
+		e.Lock()
 		if ids, ok := e.index[st]; ok {
 			// only add non-exists documentId in the index
 			if ids[len(ids)-1] != documentId {
@@ -100,6 +139,7 @@ func (e *invertedIndex) addIndex(text string, documentId int) error {
 		} else {
 			e.index[st] = []int{documentId}
 		}
+		e.Unlock()
 	}
 
 	return nil
